@@ -1,18 +1,26 @@
-name: Build Eden Android APK
+name: Build Eden Android (PowerVR Fix)
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ master, main ]
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build-android:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
-      - name: Checkout Repository
+      - name: Maximize Build Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h
+
+      - name: Checkout Repository & Submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -20,19 +28,42 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
+      - name: Install Build Dependencies & Ninja/CCache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache glslang-tools pkg-config
+
+      - name: Install Android SDK CMake 3.31.6 & NDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+          # Attempt to install CMake 3.31.6; fall back to system CMake if unavailable in SDK channel
+          if ! $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.31.6"; then
+            echo "CMake 3.31.6 not in SDK repo, falling back to system CMake..."
+            echo "cmake.dir=/usr" >> src/android/local.properties
+            SYS_CMAKE=$(cmake --version | head -n1 | awk '{print $3}')
+            find . -name "build.gradle*" -exec sed -i "s/3.31.6/$SYS_CMAKE/g" {} +
+          fi
+          # Match NDK version from build.gradle if specified
+          NDK_VER=$(grep -rn "ndkVersion" src/android/ 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "27.2.12479018")
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;${NDK_VER}"
+
+      - name: Setup Gradle & Ccache
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
-      - name: Grant Execute Permission for Gradlew
-        run: chmod +x src/android/gradlew
-
-      - name: Build Android APK
+      - name: Build Eden Android APK
         working-directory: src/android
-        run: ./gradlew assembleRelWithDebInfo
+        env:
+          JAVA_OPTS: "-Xmx4g"
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleMainlineDebug --refresh-dependencies --stacktrace || ./gradlew assembleDebug --refresh-dependencies --stacktrace
 
-      - name: Upload APK Artifact
+      - name: Upload Compiled APK
         uses: actions/upload-artifact@v4
         with:
-          name: Eden-Android-APK
+          name: eden-android-powervr-patched
           path: src/android/app/build/outputs/apk/**/*.apk
-          
+          if-no-files-found: error
