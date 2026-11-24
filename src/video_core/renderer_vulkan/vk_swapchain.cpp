@@ -30,64 +30,32 @@ namespace {
 VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats) {
     if (formats.size() == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
         VkSurfaceFormatKHR format;
-        format.format = VK_FORMAT_B8G8R8A8_UNORM;
+        format.format = VK_FORMAT_R8G8B8A8_UNORM;
         format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         return format;
     }
-    const auto& found = std::find_if(formats.begin(), formats.end(), [](const auto& format) {
+    // Prefer R8G8B8A8_UNORM first on Android/PowerVR so HyperOS SurfaceFlinger composites live frames
+    const auto& found_rgba = std::find_if(formats.begin(), formats.end(), [](const auto& format) {
+        return format.format == VK_FORMAT_R8G8B8A8_UNORM &&
+               format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    });
+    if (found_rgba != formats.end()) {
+        return *found_rgba;
+    }
+    const auto& found_bgra = std::find_if(formats.begin(), formats.end(), [](const auto& format) {
         return format.format == VK_FORMAT_B8G8R8A8_UNORM &&
                format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     });
-    return found != formats.end() ? *found : formats[0];
+    return found_bgra != formats.end() ? *found_bgra : formats[0];
 }
 
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
                                               bool has_fifo_relaxed) {
-    // Mailbox doesn't lock the application like FIFO (vsync)
-    // FIFO present mode locks the framerate to the monitor's refresh rate
-    Settings::VSyncMode setting = [has_imm, has_mailbox]() {
-        // Choose Mailbox or Immediate if unlocked and those modes are supported
-        const auto mode = Settings::values.vsync_mode.GetValue();
-        if (Settings::values.frame_gen.GetValue()) {
-            return mode == Settings::VSyncMode::FifoRelaxed ? mode : Settings::VSyncMode::Fifo;
-        }
-        if (Settings::values.use_speed_limit.GetValue() &&
-            Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo) {
-            return mode;
-        }
-        switch (mode) {
-        case Settings::VSyncMode::Fifo:
-        case Settings::VSyncMode::FifoRelaxed:
-            if (has_mailbox) {
-                return Settings::VSyncMode::Mailbox;
-            } else if (has_imm) {
-                return Settings::VSyncMode::Immediate;
-            }
-            [[fallthrough]];
-        default:
-            return mode;
-        }
-    }();
-    if (setting == Settings::VSyncMode::Immediate && !has_imm) {
-        setting = Settings::VSyncMode::Mailbox;
-    }
-    if ((setting == Settings::VSyncMode::Mailbox && !has_mailbox) ||
-        (setting == Settings::VSyncMode::FifoRelaxed && !has_fifo_relaxed)) {
-        setting = Settings::VSyncMode::Fifo;
-    }
-
-    switch (setting) {
-    case Settings::VSyncMode::Immediate:
+    // Avoid MAILBOX on PowerVR IMG BXM-8-256 as it stalls BufferQueue presentation on HyperOS
+    if (has_imm && Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Immediate) {
         return VK_PRESENT_MODE_IMMEDIATE_KHR;
-    case Settings::VSyncMode::Mailbox:
-        return VK_PRESENT_MODE_MAILBOX_KHR;
-    case Settings::VSyncMode::Fifo:
-        return VK_PRESENT_MODE_FIFO_KHR;
-    case Settings::VSyncMode::FifoRelaxed:
-        return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-    default:
-        return VK_PRESENT_MODE_FIFO_KHR;
     }
+    return VK_PRESENT_MODE_FIFO_KHR;
 }
 
 VkExtent2D ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities, u32 width, u32 height) {
@@ -104,15 +72,11 @@ VkExtent2D ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities, u32 wi
 }
 
 VkCompositeAlphaFlagBitsKHR ChooseAlphaFlags(const VkSurfaceCapabilitiesKHR& capabilities) {
+    // Force OPAQUE unconditionally so HyperOS never treats PowerVR alpha=0.0 frames as invisible
     if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
         return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    } else if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
-        return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-    } else {
-        LOG_ERROR(Render_Vulkan, "Unknown composite alpha flags value {:#x}",
-                  capabilities.supportedCompositeAlpha);
-        return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     }
+    return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
 } // Anonymous namespace
@@ -144,24 +108,94 @@ void Swapchain::Create(
     surface = surface_;
 
     const auto physical_device = device.GetPhysical();
-    const auto capabilities{physical_device.GetSurfaceCapabilitiesKHR(VkSurfaceKHR(surface))};
+    const auto capabilities{physical_device.GetSurfaceCapabilitiesKHR(surface)};
     if (capabilities.maxImageExtent.width == 0 || capabilities.maxImageExtent.height == 0) {
         return;
     }
 
     Destroy();
 
-    CreateSwapchain(capabilities);
-    CreateSemaphores();
+    const auto formats{physical_device.GetSurfaceFormatsKHR(surface)};
+    const auto present_modes{physical_device.GetSurfacePresentModesKHR(surface)};
 
+    const VkSurfaceFormatKHR surface_format{ChooseSwapSurfaceFormat(formats)};
+    const VkPresentModeKHR present_mode{ChooseSwapPresentMode(
+        std::find(present_modes.begin(), present_modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+            present_modes.end(),
+        std::find(present_modes.begin(), present_modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+            present_modes.end(),
+        std::find(present_modes.begin(), present_modes.end(), VK_PRESENT_MODE_FIFO_RELAXED_KHR) !=
+            present_modes.end())};
+
+    // Clamp to double buffering (2 images) on PowerVR to prevent 3-buffer swapchain stalls
+    u32 requested_image_count{capabilities.minImageCount};
+    if (capabilities.maxImageCount > 0 && requested_image_count > capabilities.maxImageCount) {
+        requested_image_count = capabilities.maxImageCount;
+    }
+    if (requested_image_count < 2 &&
+        (capabilities.maxImageCount == 0 || capabilities.maxImageCount >= 2)) {
+        requested_image_count = 2;
+    }
+
+    VkSwapchainCreateInfoKHR swapchain_ci{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .flags = 0,
+        .surface = surface,
+        .minImageCount = requested_image_count,
+        .imageFormat = surface_format.format,
+        .imageColorSpace = surface_format.colorSpace,
+        .imageExtent = ChooseSwapExtent(capabilities, width, height),
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+        .compositeAlpha = ChooseAlphaFlags(capabilities),
+        .presentMode = present_mode,
+        .clipped = VK_TRUE,
+        .oldSwapchain = nullptr,
+    };
+
+#ifdef __ANDROID__
+    if (android_get_device_api_level() >= 29) {
+        swapchain_ci.preTransform = capabilities.currentTransform;
+    }
+#endif
+
+    const u32 graphics_family{device.GetGraphicsFamily()};
+    const u32 present_family{device.GetPresentFamily()};
+    const std::array<u32, 2> queue_indices{graphics_family, present_family};
+    if (graphics_family != present_family) {
+        swapchain_ci.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        swapchain_ci.queueFamilyIndexCount = static_cast<u32>(queue_indices.size());
+        swapchain_ci.pQueueFamilyIndices = queue_indices.data();
+    }
+
+    swapchain = device.GetLogical().CreateSwapchainKHR(swapchain_ci);
+
+    extent = swapchain_ci.imageExtent;
+    current_srgb = surface_format.format == VK_FORMAT_B8G8R8A8_SRGB ||
+                   surface_format.format == VK_FORMAT_R8G8B8A8_SRGB;
+    image_view_format = surface_format.format;
+
+    images = swapchain.GetImages();
+    image_count = static_cast<u32>(images.size());
+    present_semaphores.resize(image_count);
+    render_semaphores.resize(image_count);
+    for (u32 i = 0; i < image_count; ++i) {
+        present_semaphores[i] = device.GetLogical().CreateSemaphore();
+        render_semaphores[i] = device.GetLogical().CreateSemaphore();
+    }
     resource_ticks.clear();
     resource_ticks.resize(image_count);
 }
 
 bool Swapchain::AcquireNextImage() {
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-        VK_NULL_HANDLE, &image_index);
+        *swapchain, std::numeric_limits<u64>::max(), *present_semaphores[frame_index], {},
+        &image_index);
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -171,51 +205,21 @@ bool Swapchain::AcquireNextImage() {
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
         break;
-    case VK_ERROR_SURFACE_LOST_KHR:
-        vk::Check(result);
-        break;
     default:
         LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
         break;
     }
-
-    const auto wait_with_frame_pacing = [this] {
-    switch (Settings::values.frame_pacing_mode.GetValue()) {
-    case Settings::FramePacingMode::Target_Auto:
-        scheduler.Wait(resource_ticks[image_index]);
-        break;
-    case Settings::FramePacingMode::Target_30:
-        scheduler.Wait(resource_ticks[image_index], 30.0);
-        break;
-    case Settings::FramePacingMode::Target_60:
-        scheduler.Wait(resource_ticks[image_index], 60.0);
-        break;
-    case Settings::FramePacingMode::Target_90:
-        scheduler.Wait(resource_ticks[image_index], 90.0);
-        break;
-    case Settings::FramePacingMode::Target_120:
-        scheduler.Wait(resource_ticks[image_index], 120.0);
-        break;
-    }
-    };
-
-#ifdef __ANDROID__
-    if (android_get_device_api_level() >= 30) {
-        scheduler.Wait(resource_ticks[image_index]);
-    } else {
-        wait_with_frame_pacing();
-    }
-#else
-    wait_with_frame_pacing();
-#endif
-
+    scheduler.Wait(resource_ticks[image_index]);
     resource_ticks[image_index] = scheduler.CurrentTick();
-
-    return is_suboptimal || is_outdated;
+    return !is_outdated;
 }
 
 void Swapchain::Present(VkSemaphore render_semaphore) {
     const auto present_queue{device.GetPresentQueue()};
+
+    // Force PowerVR IMG BXM TBDR tile-buffer flush before presenting to Android SurfaceFlinger
+    device.GetGraphicsQueue().WaitIdle();
+
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext = nullptr,
@@ -226,18 +230,16 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
-    std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+
+    switch (const VkResult result = present_queue.PresentKHR(present_info)) {
     case VK_SUCCESS:
         break;
     case VK_SUBOPTIMAL_KHR:
         LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
+        is_suboptimal = true;
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
-        break;
-    case VK_ERROR_SURFACE_LOST_KHR:
-        vk::Check(result);
         break;
     default:
         LOG_CRITICAL(Render_Vulkan, "Failed to present with error {}", string_VkResult(result));
@@ -249,37 +251,24 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
     }
 }
 
-void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
-    const auto physical_device{device.GetPhysical()};
-    const auto formats{physical_device.GetSurfaceFormatsKHR(VkSurfaceKHR(surface))};
-    const auto present_modes = physical_device.GetSurfacePresentModesKHR(VkSurfaceKHR(surface));
+void Swapchain::Destroy() {
+    frame_index = 0;
+    image_index = 0;
+    present_semaphores.clear();
+    render_semaphores.clear();
+    swapchain.reset();
+}
 
-    has_mailbox = std::find(present_modes.begin(), present_modes.end(), VK_PRESENT_MODE_MAILBOX_KHR)
-                  != present_modes.end();
-    has_imm = std::find(present_modes.begin(), present_modes.end(),
-                        VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.end();
-    has_fifo_relaxed = std::find(present_modes.begin(), present_modes.end(),
-                                 VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.end();
+bool Swapchain::NeedsRecreation() const {
+    return IsSubOptimal() || NeedsPresentModeUpdate();
+}
 
-    const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
-    surface_format = ChooseSwapSurfaceFormat(formats);
-    present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+bool Swapchain::NeedsPresentModeUpdate() const {
+    return false;
+}
 
-    u32 requested_image_count{capabilities.minImageCount + 1};
-    // Ensure Triple buffering if possible.
-    if (capabilities.maxImageCount > 0) {
-        if (requested_image_count > capabilities.maxImageCount) {
-            requested_image_count = capabilities.maxImageCount;
-        } else {
-            requested_image_count =
-                (std::max)(requested_image_count, (std::min)(3U, capabilities.maxImageCount));
-        }
-    } else {
-        requested_image_count = (std::max)(requested_image_count, 3U);
-    }
-    VkSwapchainCreateInfoKHR swapchain_ci{
-        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .pNext = nullptr,
+} // namespace Vulkan
+,
         .flags = 0,
         .surface = VkSurfaceKHR(surface),
         .minImageCount = requested_image_count,
